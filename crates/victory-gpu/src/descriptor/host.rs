@@ -1806,7 +1806,25 @@ fn view_extent() -> bool {
 /// part's one), and for buffer objects, a part that also lies in a smaller
 /// buffer object. The slot then showed a copy nothing brought up to date,
 /// and what shaders wrote through it was looked for in the other copy.
+/// The host copy for a constant buffer view at `address` (`size` bytes):
+/// the title memory's copy if 256-byte aligned there, otherwise an exact
+/// host copy of its own (`exact`), which starts 256-byte aligned.
+fn constant_shadow(address: u64, size: u32) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
+    if size == 0 {
+        return None;
+    }
+    let found = crate::shadow::find(address, u64::from(size))?;
+    if found.gpu(address).is_multiple_of(256) {
+        Some(found)
+    } else {
+        crate::shadow::exact(address, u64::from(constant_size(size)))
+    }
+}
+
 pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
+    if let &View::Constant(address, size) = view {
+        return constant_shadow(address, size).map(|shadow| (shadow, address, u64::from(size)));
+    }
     let (address, len) = buffer_range(view)?;
     if len == 0 {
         return None;
@@ -2285,17 +2303,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
-            let shadow = crate::shadow::find(address, u64::from(size))?;
-            let gpu = shadow.gpu(address);
-            if gpu % 256 != 0 {
-                once!(
-                    address = format_args!("{address:#x}"),
-                    "constant buffer not 256-byte aligned on the host"
-                );
-                return None;
-            }
+            let shadow = constant_shadow(address, size)?;
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
-                BufferLocation: gpu,
+                BufferLocation: shadow.gpu(address),
                 SizeInBytes: constant_size(size),
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
@@ -2910,6 +2920,16 @@ mod tests {
         assert_eq!((address, len), (start + 8, 72 * 4));
         assert_eq!(copy.span(), (start + 8, 72 * 4));
         assert_eq!(kept.as_ref(), Some(&copy.buffer));
+
+        // An unaligned constant buffer view (16 bytes into title memory) gets
+        // a 256-byte-aligned exact copy, not left null.
+        let cbv = View::Constant(start + 16, 64);
+        let kept = make(&cbv, heap.cpu(3)).flatten().expect("unaligned CBV, not left null");
+        let (copy, address, len) = buffer_copy(&cbv).unwrap();
+        assert_eq!((address, len), (start + 16, 64));
+        assert_eq!(copy.span(), (start + 16, 256));
+        assert_eq!(kept, copy.buffer);
+        assert_eq!(copy.gpu(start + 16) % 256, 0);
         crate::shadow::unregister(RESOURCE, start);
     }
 
