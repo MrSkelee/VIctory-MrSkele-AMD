@@ -1588,6 +1588,9 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// Buffer ranges marked written by shaders since the last refresh of
+    /// that copy or title copy (host copy, address, bytes).
+    gpu_written: std::collections::HashSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -2661,8 +2664,10 @@ fn read_backs(list: &HostList) {
 /// into title memory, and the ranges are done with.
 fn hand_back(back: &[Declared]) {
     if crate::shadow::wide_back() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
         // Every range first (the pieces that differ, found on several
-        // threads), then the merges, in order, as below.
+        // threads), then the merges (on several threads when non-overlapping
+        // in title memory, else sequentially).
         let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
         for (shadow, declared) in back {
             if shadow.carded() {
@@ -2684,11 +2689,61 @@ fn hand_back(back: &[Declared]) {
         let found = crate::shadow::find_all(&work);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
-        for ((shadow, from, to), found) in work.iter().zip(found) {
-            let written = shadow.copy_back_with(*from, to - from, Some(found));
+        let mut pieces: Vec<(usize, std::sync::Arc<crate::shadow::Shadow>, usize, usize, usize, usize)> = Vec::new();
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        for (idx, ((shadow, from, to), differing)) in work.iter().zip(found).enumerate() {
+            if let Some((copy_from, before_from)) = shadow.copy_back_prepare(*from, to - from, &differing) {
+                for &(at, n) in &differing {
+                    spans.push(shadow.title_span(at, n));
+                    pieces.push((idx, shadow.clone(), copy_from, before_from, at, n));
+                }
+            }
+        }
+        spans.sort_unstable();
+        let disjoint = spans.windows(2).all(|w| w[0].1 <= w[1].0);
+        let written_by_work: Vec<AtomicUsize> = (0..work.len()).map(|_| AtomicUsize::new(0)).collect();
+        if disjoint && pieces.len() >= 2 {
+            let written_ref = &written_by_work;
+            let each = pieces.len().div_ceil(8);
+            // `written_ref` and raw snapshot pointers live through `wide_run`,
+            // which blocks until every job returns (before `copy_back_done`).
+            let written_ptr = written_ref.as_ptr() as usize;
+            let written_len = written_ref.len();
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = pieces
+                .chunks(each)
+                .map(|chunk| {
+                    let chunk = chunk.to_vec();
+                    Box::new(move || {
+                        // SAFETY: slice outlives `wide_run`, one atomic per work item.
+                        let counts = unsafe { std::slice::from_raw_parts(written_ptr as *const AtomicUsize, written_len) };
+                        let mut title = Vec::new();
+                        for (idx, shadow, copy_from, before_from, at, n) in chunk {
+                            // SAFETY: disjoint title spans and snapshot stays alive until `copy_back_done`.
+                            let w = unsafe { shadow.copy_back_piece_at(copy_from, before_from, at, n, &mut title) };
+                            if w > 0 {
+                                counts[idx].fetch_add(w, AtomicOrdering::Relaxed);
+                            }
+                        }
+                    }) as Box<dyn FnOnce() + Send>
+                })
+                .collect();
+            crate::shadow::wide_run(jobs);
+        } else {
+            let mut title = Vec::new();
+            for (idx, shadow, copy_from, before_from, at, n) in pieces {
+                // SAFETY: sequential execution on owning thread, snapshot alive.
+                let w = unsafe { shadow.copy_back_piece_at(copy_from, before_from, at, n, &mut title) };
+                if w > 0 {
+                    written_by_work[idx].fetch_add(w, AtomicOrdering::Relaxed);
+                }
+            }
+        }
+        for (idx, (_shadow, from, to)) in work.iter().enumerate() {
+            let written = written_by_work[idx].load(AtomicOrdering::Relaxed);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(*from, to - from, written);
+            let _ = (from, to);
         }
         for (shadow, declared) in back {
             shadow.copy_back_done(declared);
@@ -4872,6 +4927,7 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        deferred.gpu_written.clear();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -4892,8 +4948,10 @@ impl HostList {
         len: usize,
     ) {
         let mut deferred = self.deferred();
-        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        let ptr = std::sync::Arc::as_ptr(shadow) as usize;
+        let key = (ptr, address, len);
         if deferred.refreshed.insert(key) {
+            deferred.gpu_written.retain(|k| k.0 != ptr);
             deferred
                 .copies
                 .push(Step::Refresh(shadow.clone(), address, len));
@@ -4908,9 +4966,13 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        let mut deferred = self.deferred();
+        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        if deferred.gpu_written.insert(key) {
+            deferred
+                .copies
+                .push(Step::GpuWrite(shadow.clone(), address, len));
+        }
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
@@ -4981,7 +5043,13 @@ impl HostList {
 
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
+    #[allow(dead_code)]
     pub(crate) fn budget(&self) -> Option<u64> {
+        self.budget_resource().map(|(_, gpu)| gpu)
+    }
+
+    /// The host resource and GPU address of the list's indirect-work budget.
+    pub(crate) fn budget_resource(&self) -> Option<(&ID3D12Resource, u64)> {
         let (buffer, data) = self
             .budget
             .get_or_init(|| {
@@ -5008,7 +5076,7 @@ impl HostList {
             })));
         }
         // SAFETY: a live buffer.
-        Some(unsafe { buffer.GetGPUVirtualAddress() })
+        Some((buffer, unsafe { buffer.GetGPUVirtualAddress() }))
     }
 
     /// A device-local unordered-access buffer of at least `size` bytes for
@@ -5054,8 +5122,10 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.refreshed.clear();
+        deferred.gpu_written.clear();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
@@ -5167,7 +5237,7 @@ impl HostList {
 /// spread over the threads kept for the snapshots (`crate::shadow::wide`).
 /// The write-watch journal and the guards are behind their own locks, as
 /// they are for the title's threads.
-fn wide_refresh() -> bool {
+pub(crate) fn wide_refresh() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_some_and(|v| v == "1"))
 }
@@ -5262,7 +5332,7 @@ impl Batch {
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
-        if wide_refresh() && self.refreshes.len() >= 4 {
+        if wide_refresh() && self.refreshes.len() >= 2 {
             // Each copy on its own, several at a time: a copy's refresh
             // writes that copy and reads title memory, nothing of another's.
             // The time counted is the time it took, not the threads' sum.
@@ -5379,7 +5449,7 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
             crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
             // SAFETY: this path is only used with a writable host destination.
             unsafe { to.write_bytes(0, n) };
-        } else if !read(at, to, n) {
+        } else if !read_kernel(at, to, n) {
             // A mapping may change between query and read.
             read_pieces(at, to, n);
         }
@@ -5389,13 +5459,14 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
 
 fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
     // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
-    // that fails), zeros for what cannot be read.
+    // that fails), zeros for what cannot be read. Use `read_kernel` so
+    // known-sparse holes do not trigger user-mode SEH faults per page.
     for_pieces(src as usize, len, 64 << 10, |at, n| {
         let to = dst.wrapping_add(at - src as usize);
-        if !read(at as *const u8, to, n) {
+        if !read_kernel(at as *const u8, to, n) {
             for_pieces(at, n, 4 << 10, |at, n| {
                 let to = dst.wrapping_add(at - src as usize);
-                if !read(at as *const u8, to, n) {
+                if !read_kernel(at as *const u8, to, n) {
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
                     // SAFETY: inside the destination, which is mapped.
@@ -5412,9 +5483,31 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     read(src, dst.as_mut_ptr(), dst.len())
 }
 
+#[cfg(all(windows, target_env = "msvc"))]
+unsafe extern "C" {
+    fn victory_try_copy(dst: *mut u8, src: *const u8, len: usize) -> std::ffi::c_int;
+}
+
+/// Whether copies use MSVC SEH `memmove` (`victory_try_copy`) instead of a
+/// `ReadProcessMemory` kernel syscall per copy (`VICTORY_FAST_COPY=0` reverts).
+fn fast_copy() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FAST_COPY").is_none_or(|v| v != "0"))
+}
+
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
 /// readable.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    #[cfg(all(windows, target_env = "msvc"))]
+    if fast_copy() {
+        // SAFETY: `dst` is writable host/title memory of `len` bytes;
+        // `victory_try_copy` guards `memmove` with SEH for access violations.
+        return victory_core::with_try_copy(|| unsafe { victory_try_copy(dst, src, len) != 0 });
+    }
+    read_kernel(src, dst, len)
+}
+
+fn read_kernel(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
@@ -6374,6 +6467,29 @@ fn pump() {
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
         }
+    }
+}
+
+#[cfg(test)]
+mod fast_copy_tests {
+    #[test]
+    fn read_into_copies_mapped_and_rejects_unmapped_safely() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, VirtualAlloc, VirtualFree,
+        };
+        let src: Vec<u8> = (0..8192usize).map(|i| (i & 0xff) as u8).collect();
+        let mut dst = vec![0u8; 8192];
+        assert!(super::read_into(src.as_ptr(), &mut dst));
+        assert_eq!(dst, src);
+
+        // SAFETY: reserves one unmapped page to verify SEH / ReadProcessMemory fallback.
+        let unmapped = unsafe { VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!unmapped.is_null());
+        let mut out = vec![0xAAu8; 64];
+        let ok = super::read_into(unmapped.cast(), &mut out);
+        // SAFETY: releases the reservation allocated above.
+        unsafe { VirtualFree(unmapped, 0, MEM_RELEASE) };
+        assert!(!ok);
     }
 }
 

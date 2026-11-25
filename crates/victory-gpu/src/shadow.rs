@@ -847,6 +847,7 @@ fn give_back(v: Vec<u8>) {
 }
 
 const NOT_WATCHED: u8 = 2;
+const GUARDED_VIEW: u8 = 3;
 
 /// Where `a` and `b` (of one length) first differ, compared eight bytes at
 /// a time.
@@ -978,9 +979,10 @@ fn workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 2).clamp(2, 10);
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
+                ON_WORKER.with(|on| on.set(true));
                 let workers = WORKERS.get().expect("made above");
                 loop {
                     let job = {
@@ -1000,10 +1002,14 @@ fn workers() -> &'static Workers {
     workers
 }
 
+thread_local! {
+    static ON_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Runs `jobs` on the kept threads and on this one, and returns when all
 /// of them are done. The jobs copy and compare memory; they do not panic.
 fn wide(jobs: Vec<Job>) {
-    if jobs.len() < 2 {
+    if jobs.len() < 2 || ON_WORKER.with(|on| on.get()) {
         for job in jobs {
             job();
         }
@@ -1917,43 +1923,7 @@ impl Shadow {
             }
             let mut title = vec![0u8; PIECE];
             for (at, n) in differing {
-                // SAFETY: inside the mapping; only the submitting thread
-                // writes it.
-                let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
-                // From the first byte that differs to the last: title
-                // memory is read and written there only (a shader that sets
-                // a few words of a piece cost a read, a walk and a write of
-                // all 64 KiB of it).
-                let Some(first) = first_difference(host, old) else {
-                    continue;
-                };
-                let last = last_difference(host, old).unwrap_or(first);
-                let (at, n) = (at + first, last + 1 - first);
-                let (host, old) = (&mut host[first..=last], &old[first..=last]);
-                let title = &mut title[..n];
-                if !crate::host::read_into((start + at) as *const u8, title) {
-                    continue;
-                }
-                // Title memory with the GPU's bytes put in; the copy takes
-                // the title's bytes in turn.
-                // Without a branch, so the loop runs many bytes at a time:
-                // the GPU's byte where the copy's byte is not what it was
-                // before the submission, else the title's. (With the two
-                // searches above this was 44 ms a frame for 970 pieces.)
-                let mut differs = 0u8;
-                for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                    let gpu = if *h != *o { 0xffu8 } else { 0 };
-                    let merged = (*t & !gpu) | (*h & gpu);
-                    differs |= merged ^ *t;
-                    *t = merged;
-                    *h = merged;
-                }
-                if differs != 0 {
-                    crate::watch::writing(start + at, n);
-                    crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                    written += n;
-                }
+                written += self.copy_back_one(start, at, n, &before[at - from..at - from + n], &mut title);
             }
             // Our write shows as a title write at the copy's next refresh,
             // which copies those pages once more (some dozens of MB a
@@ -1964,6 +1934,89 @@ impl Shadow {
             crate::copystat::add(crate::copystat::C::BackSyncUs, syncing.elapsed().as_micros() as u64);
         }
         written
+    }
+
+    /// Prepares parallel piece copy-back (`hand_back` with `wide_back`):
+    /// marks `differing` pieces dirty in `kept` and returns `(from, before_ptr)`
+    /// for `[from, to)`, valid until `copy_back_done`.
+    pub(crate) fn copy_back_prepare(&self, address: usize, len: usize, differing: &[(usize, usize)]) -> Option<(usize, usize)> {
+        if self.place.is_some() {
+            return None;
+        }
+        let (from, to) = self.inside(address, len);
+        self.compared(from, to);
+        if from >= to || differing.is_empty() {
+            return None;
+        }
+        let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let before = snapshot.as_ref()?;
+        for &(at, n) in differing {
+            self.changed(at, at + n);
+        }
+        // SAFETY: `from <= before.len()` and `before` stays alive until `copy_back_done`.
+        Some((from, unsafe { before.as_ptr().add(from) } as usize))
+    }
+
+    /// Title virtual address span `[start + at, start + at + n)` for piece merge.
+    pub(crate) fn title_span(&self, at: usize, n: usize) -> (usize, usize) {
+        let s = self.start as usize + at;
+        (s, s + n)
+    }
+
+    /// Merges a single differing 64 KiB piece `(at, n)` into title memory
+    /// (`before_from` holds bytes starting at offset `from`).
+    ///
+    /// # Safety
+    /// `before_from` must point to readable snapshot bytes for `[from, at + n)`
+    /// and caller must ensure disjointness in title memory with any concurrent calls.
+    pub(crate) unsafe fn copy_back_piece_at(
+        &self,
+        from: usize,
+        before_from: usize,
+        at: usize,
+        n: usize,
+        title: &mut Vec<u8>,
+    ) -> usize {
+        if title.len() < PIECE {
+            title.resize(PIECE, 0);
+        }
+        let start = self.start as usize;
+        // SAFETY: caller guarantees valid snapshot slice starting at `from`.
+        let old = unsafe { std::slice::from_raw_parts((before_from + (at - from)) as *const u8, n) };
+        self.copy_back_one(start, at, n, old, title)
+    }
+
+    fn copy_back_one(&self, start: usize, at: usize, n: usize, old: &[u8], title: &mut [u8]) -> usize {
+        // SAFETY: inside the mapping; disjoint offsets across parallel pieces.
+        let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+        // From the first byte that differs to the last: title memory is read
+        // and written there only.
+        let Some(first) = first_difference(host, old) else {
+            return 0;
+        };
+        let last = last_difference(host, old).unwrap_or(first);
+        let (at, n) = (at + first, last + 1 - first);
+        let (host, old) = (&mut host[first..=last], &old[first..=last]);
+        let title = &mut title[..n];
+        if !crate::host::read_into((start + at) as *const u8, title) {
+            return 0;
+        }
+        // Title memory with the GPU's bytes put in; the copy takes the title's
+        // bytes in turn.
+        let mut differs = 0u8;
+        for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
+            let gpu = if *h != *o { 0xffu8 } else { 0 };
+            let merged = (*t & !gpu) | (*h & gpu);
+            differs |= merged ^ *t;
+            *t = merged;
+            *h = merged;
+        }
+        if differs != 0 {
+            crate::watch::writing(start + at, n);
+            crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+            return n;
+        }
+        0
     }
 
     /// Offsets `[from, to)` of the copy are compared with the snapshot: for
@@ -2387,9 +2440,15 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
-        if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
-                self.watched.store(1, Ordering::Relaxed);
+        let watched = self.watched.load(Ordering::Relaxed);
+        if watched != NOT_WATCHED {
+            let ask = if watched == GUARDED_VIEW {
+                crate::watch::view_writes(from, to).map(|(now, w)| (now, w, true))
+            } else {
+                crate::watch::writes_kind(from, to, true)
+            };
+            if let Some((now, written, via_guard)) = ask {
+                self.watched.store(if via_guard { GUARDED_VIEW } else { 1 }, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
                 #[cfg(feature = "diagnostics")]
                 {
@@ -2452,13 +2511,32 @@ impl Shadow {
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return 0;
+        }
+        let len = to - from;
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
-        crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        if len >= (2 << 20) && crate::host::wide_refresh() && !ON_WORKER.with(|on| on.get()) {
+            let mut off = 0usize;
+            let mut jobs: Vec<Job> = Vec::new();
+            while off < len {
+                let n = (len - off).min(WIDE_JOB);
+                let dst = (at as usize) + off;
+                let src = from + off;
+                jobs.push(Box::new(move || {
+                    crate::host::copy_mapped(dst as *mut u8, src as *const u8, n, false);
+                }));
+                off += n;
+            }
+            wide(jobs);
+        } else {
+            crate::host::copy_mapped(at, from as *const u8, len, false);
+        }
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
-        to - from
+        len
     }
 
     /// Whether shaders read and write this copy in the card's own memory

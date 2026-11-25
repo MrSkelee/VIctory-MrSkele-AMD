@@ -1056,7 +1056,7 @@ impl HostHeap {
         use std::sync::atomic::Ordering::Relaxed;
         /// Slots looked at at a time, and the least time between.
         const SLOTS: u32 = 1 << 15;
-        const EVERY_MS: u64 = 100;
+        const EVERY_MS: u64 = 500;
         static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
         let mode = *MODE.get_or_init(|| match std::env::var("VICTORY_TEXTURE_SWEEP").as_deref() {
             Ok("0") => 0,

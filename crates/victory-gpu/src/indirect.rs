@@ -268,8 +268,8 @@ pub(crate) fn bound(
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
+    let (c, (budget_res, budget), dst) = (clamp()?, list.budget_resource()?, list.indirect_scratch(bytes)?);
+    record_clamp_with(c, &list.list, &dst, budget, Some(budget_res), src, count, spec, 0).then_some(dst)
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will
@@ -288,8 +288,8 @@ pub(crate) fn bound_ahead(
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, AHEAD).then_some(dst)
+    let (c, (budget_res, budget), dst) = (clamp()?, list.budget_resource()?, list.indirect_scratch(bytes)?);
+    record_clamp_with(c, &list.list, &dst, budget, Some(budget_res), src, None, spec, AHEAD).then_some(dst)
 }
 
 /// The parts [`bound_split`] makes of a dispatch, the most groups of each,
@@ -309,15 +309,16 @@ pub(crate) const PART_BYTES: u64 = 12;
 pub(crate) fn bound_split(list: &HostList, src: (&ID3D12Resource, u64)) -> Option<ID3D12Resource> {
     let spec = (2, 12, 1);
     validate_layout(spec, src.1, None)?;
-    let (c, budget) = (clamp()?, list.budget()?);
+    let (c, (budget_res, budget)) = (clamp()?, list.budget_resource()?);
     let dst = list.indirect_scratch(u64::from(SPLIT) * PART_BYTES)?;
-    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, IN_PARTS).then_some(dst)
+    record_clamp_with(c, &list.list, &dst, budget, Some(budget_res), src, None, spec, IN_PARTS).then_some(dst)
 }
 
 /// Bits of the clamp's `has_count`.
 const AHEAD: u32 = 2;
 const IN_PARTS: u32 = 4;
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn record_clamp(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
@@ -327,18 +328,34 @@ fn record_clamp(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> bool {
-    record_clamp_as(c, l, dst, budget, src, count, spec, 0)
+    record_clamp_with(c, l, dst, budget, None, src, count, spec, 0)
 }
 
 /// [`record_clamp`]; `how`: [`AHEAD`], the records are a window clamped
 /// ahead of their draws ([`bound_ahead`]); [`IN_PARTS`], one dispatch in
 /// parts ([`bound_split`]).
+#[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 fn record_clamp_as(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
     dst: &ID3D12Resource,
     budget: u64,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    how: u32,
+) -> bool {
+    record_clamp_with(c, l, dst, budget, None, src, count, spec, how)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_clamp_with(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    dst: &ID3D12Resource,
+    budget: u64,
+    budget_res: Option<&ID3D12Resource>,
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
@@ -400,26 +417,39 @@ fn record_clamp_as(
     let waits = crate::copystat::barrier_test() & 2 == 0;
     #[cfg(not(feature = "diagnostics"))]
     let waits = true;
-    let first = [
-        uav_barrier(),
-        transition(
-            dst,
-            D3D12_RESOURCE_STATE_COMMON,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        ),
-    ];
-    let second = [
-        uav_barrier(),
-        transition(
-            dst,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-        ),
-    ];
-    let skip = usize::from(!waits);
+    static GLOBAL_BARRIERS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let global = budget_res.is_none()
+        || *GLOBAL_BARRIERS.get_or_init(|| std::env::var_os("VICTORY_GLOBAL_INDIRECT_BARRIERS").is_some_and(|v| v == "1"));
+    let to_uav = transition(
+        dst,
+        D3D12_RESOURCE_STATE_COMMON,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+    );
+    let to_indirect = transition(
+        dst,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+    );
+    let mut first = Vec::with_capacity(4);
+    if waits {
+        if global {
+            first.push(uav_barrier(None));
+        } else {
+            first.push(uav_barrier(Some(src)));
+            if let Some((count_res, _)) = count
+                && windows::core::Interface::as_raw(count_res) != windows::core::Interface::as_raw(src)
+            {
+                first.push(uav_barrier(Some(count_res)));
+            }
+            if let Some(budget_res) = budget_res {
+                first.push(uav_barrier(Some(budget_res)));
+            }
+        }
+    }
+    first.push(to_uav);
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
-        l.ResourceBarrier(&first[skip..]);
+        l.ResourceBarrier(&first);
         if records > 0 {
             l.SetComputeRootSignature(&c.root);
             l.SetPipelineState(&c.pso);
@@ -430,7 +460,11 @@ fn record_clamp_as(
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
-        l.ResourceBarrier(&second[skip..]);
+        if waits && global {
+            l.ResourceBarrier(&[uav_barrier(None), to_indirect]);
+        } else {
+            l.ResourceBarrier(&[to_indirect]);
+        }
     }
     true
 }
@@ -452,13 +486,18 @@ fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
     };
 }
 
-fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
+fn uav_barrier(resource: Option<&ID3D12Resource>) -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
         Anonymous: D3D12_RESOURCE_BARRIER_0 {
             UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                pResource: std::mem::ManuallyDrop::new(None),
+                // SAFETY: either null (global UAV barrier) or a borrowed pointer
+                // inside `ManuallyDrop` which the barrier never releases.
+                pResource: match resource {
+                    Some(r) => unsafe { std::mem::transmute_copy(r) },
+                    None => std::mem::ManuallyDrop::new(None),
+                },
             }),
         },
     }

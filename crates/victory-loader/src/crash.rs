@@ -371,7 +371,9 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
     // SAFETY: as above.
-    if FATAL.contains(&unsafe { (*(*info).ExceptionRecord).ExceptionCode }) {
+    if !victory_core::in_try_copy()
+        && FATAL.contains(&unsafe { (*(*info).ExceptionRecord).ExceptionCode })
+    {
         // SAFETY: as above.
         unsafe { report("first-chance exception", info, false) };
     }

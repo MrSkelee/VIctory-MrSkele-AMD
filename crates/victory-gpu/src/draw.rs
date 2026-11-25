@@ -99,7 +99,7 @@ struct Window {
 }
 
 /// The most records clamped in one pass ([`windows`]).
-const WINDOW_MOST: u64 = 64;
+const WINDOW_MOST: u64 = 256;
 
 /// Whether indirect draws that read record after record of one argument
 /// buffer are clamped a window at a time (`VICTORY_INDIRECT_WINDOW=1`; off
@@ -143,7 +143,7 @@ const WINDOW_MOST: u64 = 64;
 /// before, at the next submission.
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_none_or(|v| v != "0"))
 }
 
 /// What one title list has set, and what its host list was last given.
@@ -964,7 +964,14 @@ impl State {
                 None
             };
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                let mut stack = [0u32; 64];
+                let mut heap_values: Vec<u32>;
+                let values: &mut [u32] = if (dwords as usize) <= stack.len() {
+                    &mut stack[..dwords as usize]
+                } else {
+                    heap_values = vec![0u32; dwords as usize];
+                    &mut heap_values
+                };
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
                         values[u.index as usize] =
@@ -1347,16 +1354,19 @@ impl State {
         // released resource goes stale without a write, and a slot written
         // before its memory had a host copy is only made then.
         type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
-        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
+        type Spans = std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
+        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges, Spans)>>> =
             std::sync::Mutex::new(None);
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
-        let (passes, ranges) = kept
+        let (passes, ranges, spans) = kept
             .get_or_insert_with(Default::default)
             .entry(std::ptr::from_ref(host) as usize)
-            .or_insert_with(|| (0, Ranges::new()));
+            .or_insert_with(|| (0, Ranges::new(), Spans::new()));
         let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
+        let mut rebuild_spans = *passes > 0 && *passes % 64 == 0;
+        let slots = if rebuild_spans {
             ranges.clear();
+            spans.clear();
             host.buffer_slots()
         } else {
             changed
@@ -1367,7 +1377,16 @@ impl State {
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         for (n, &index) in slots.iter().enumerate() {
-            ranges.remove(&index);
+            if let Some((old_shadow, old_from, old_to)) = ranges.remove(&index)
+                && !rebuild_spans
+            {
+                let old_key = std::sync::Arc::as_ptr(&old_shadow) as usize;
+                if let Some((_, s_from, s_to)) = spans.get(&old_key)
+                    && (old_from <= *s_from || old_to >= *s_to)
+                {
+                    rebuild_spans = true;
+                }
+            }
             let Some(handle) = heap.handle(index) else {
                 continue;
             };
@@ -1398,20 +1417,28 @@ impl State {
             if host.shows(index, &shadow.buffer) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
-            ranges.insert(index, (shadow, address, address + len));
+            let (from, to) = (address, address + len);
+            if !rebuild_spans {
+                let key = std::sync::Arc::as_ptr(&shadow) as usize;
+                let span = spans.entry(key).or_insert_with(|| (shadow.clone(), from, to));
+                span.1 = span.1.min(from);
+                span.2 = span.2.max(to);
+            }
+            ranges.insert(index, (shadow, from, to));
         }
         let views = ranges.len() as u32;
-        // Per host copy, the span its picked views cover.
-        let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-            std::collections::HashMap::new();
-        for (shadow, from, to) in ranges.values() {
-            let key = std::sync::Arc::as_ptr(shadow) as usize;
-            let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
-            span.1 = span.1.min(*from);
-            span.2 = span.2.max(*to);
+        if rebuild_spans {
+            spans.clear();
+            for (shadow, from, to) in ranges.values() {
+                let key = std::sync::Arc::as_ptr(shadow) as usize;
+                let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
+                span.1 = span.1.min(*from);
+                span.2 = span.2.max(*to);
+            }
         }
+        let refresh_list: Vec<_> = spans.values().cloned().collect();
         drop(kept);
-        let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
+        let bytes: u64 = refresh_list.iter().map(|s| s.2 - s.1).sum();
         // Memory that is not write-watched is copied whole by every refresh.
         // It was once refreshed only every 120 frames (unmapped pages read
         // one by one cost 14 GB a frame in run 11, before they were
@@ -1422,7 +1449,7 @@ impl State {
         static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
         let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
         let whole = whole.get_or_insert_with(Default::default);
-        for (shadow, from, to) in spans.values() {
+        for (shadow, from, to) in &refresh_list {
             if shadow.unwatched() {
                 // By the copy's number: a copy made where one let go was
                 // (`shadow::let_go_idle`) has never been refreshed.
@@ -1442,7 +1469,7 @@ impl State {
                     }
                 }
             }
-            shadow.refresh(list, *from, to - from);
+            shadow.refresh(list, *from, *to - *from);
         }
         self.heap_textures(list, heap, host);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
@@ -1455,7 +1482,7 @@ impl State {
             tracing::info!(
                 slots = slots.len(),
                 views,
-                copies = spans.len(),
+                copies = refresh_list.len(),
                 mb = bytes >> 20,
                 ms = started.elapsed().as_millis(),
                 "buffer views of the heap made ready for shaders that pick them by index"
@@ -1551,16 +1578,22 @@ impl State {
             user_data: 0,
             slot: 0,
         };
-        // Also within a time per pass: the pass runs on a thread that
-        // records the frame, and making and staging 192 MB of textures took
-        // 1.6-2.2 s of each of the world's first twenty frames (run 20).
-        // The rest waits for the next frames, as it does past the bytes.
-        const SPAN: std::time::Duration = std::time::Duration::from_millis(250);
-        const SPAN_CATCHING_UP: std::time::Duration = std::time::Duration::from_millis(1500);
+        // Also within a time per pass: restore full default throughput unless
+        // `VICTORY_HEAP_TEXTURE_MS` overrides it so textures don't stay black.
+        static SPAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let span_ms = *SPAN_MS.get_or_init(|| {
+            std::env::var("VICTORY_HEAP_TEXTURE_MS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(250)
+                .max(1)
+        });
+        let span_normal = std::time::Duration::from_millis(span_ms);
+        let span_catching_up = std::time::Duration::from_millis(span_ms.saturating_mul(6).max(1500));
         let (per_frame, span) = if census[0] > LONG && catching_up(std::time::Duration::ZERO) {
-            (PER_FRAME_CATCHING_UP, SPAN_CATCHING_UP)
+            (PER_FRAME_CATCHING_UP, span_catching_up)
         } else {
-            (PER_FRAME, SPAN)
+            (PER_FRAME, span_normal)
         };
         let began = std::time::Instant::now();
         for (index, write) in due {
@@ -1701,7 +1734,7 @@ impl State {
                 host.texture_slot_recheck(index, frame, (at, len), crate::texture::fingerprint(at, len));
             }
         }
-        catching_up(began.elapsed().saturating_sub(SPAN));
+        catching_up(began.elapsed().saturating_sub(span_normal));
     }
 
     /// For the frame listing, after a dropped dispatch's line: its group

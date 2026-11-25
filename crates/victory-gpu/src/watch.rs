@@ -304,11 +304,20 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    writes_kind(start, end, guarded).map(|(now, written, _)| (now, written))
+}
+
+/// Like [`writes`], and whether the memory is guarded view memory rather
+/// than write-watched.
+pub(crate) fn writes_kind(
+    start: usize,
+    end: usize,
+    guarded: bool,
+) -> Option<(u64, Vec<(usize, u64)>, bool)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
         return Some((
@@ -317,10 +326,12 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
                 .range(first..last)
                 .map(|(&p, &w)| (p, w))
                 .collect(),
+            false,
         ));
     }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
-    j.found.resize(count.max(j.found.len()), 0);
+    let need = count.max(j.found.len());
+    j.found.resize(need, 0);
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
@@ -335,8 +346,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             &mut granularity,
         )
     } != 0;
-    let guarded = if failed {
-        count = 0;
+    let (guarded_pages, from_guard) = if failed {
+        drop(j);
         if !guarded {
             return None;
         }
@@ -345,9 +356,12 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         let written = guard(first * PAGE, last * PAGE);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
-        written?
+        let written = written?;
+        j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        count = 0;
+        (written, true)
     } else {
-        Vec::new()
+        (Vec::new(), false)
     };
     #[cfg(feature = "diagnostics")]
     {
@@ -356,10 +370,48 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         add(C::WatchUs, started.elapsed().as_micros() as u64);
         slow(started.elapsed().as_micros() as u64);
     }
+    let j = &mut *j;
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
+    for &at in &j.found[..count] {
+        j.written.insert(at / PAGE, now);
+    }
+    for page in guarded_pages {
+        j.written.insert(page, now);
+    }
+    Some((
+        now,
+        j.written
+            .range(first..last)
+            .map(|(&p, &w)| (p, w))
+            .collect(),
+        from_guard,
+    ))
+}
+
+/// Like [`writes`], when `[start, end)` is known to be guarded view
+/// memory rather than write-watched: skips the failing `GetWriteWatch`.
+pub(crate) fn view_writes(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    #[cfg(feature = "diagnostics")]
+    let guarding = std::time::Instant::now();
+    let written = guard(first * PAGE, last * PAGE);
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
+    let written = written?;
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::Watches, 1);
+        add(C::WatchUs, started.elapsed().as_micros() as u64);
+        slow(started.elapsed().as_micros() as u64);
+    }
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    j.asked += 1;
+    let now = j.asked;
+    for page in written {
         j.written.insert(page, now);
     }
     Some((
@@ -411,29 +463,37 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // of the 68 ms a frame of "guards" (run 58).
     // `VICTORY_GUARD_ASK=1` asks every time, as before.
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
-        let g = guards();
-        let first = start / BLOCK;
-        g.protected.contains(&first) || g.absent.contains(&first)
-    };
-    if !known && !is_view(start, end) {
-        return None;
-    }
-    install();
+    let ask_each = *ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"));
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     let mut g = guards();
+    let known = !ask_each && (g.protected.contains(&first) || g.absent.contains(&first));
+    if known && g.clean.range(first..last).count() == last - first {
+        // Nothing written, mapped or new since the range was last taken:
+        // single lock check with no heap allocation (`Vec`).
+        return Some(Vec::new());
+    }
+    if !known {
+        drop(g);
+        if !is_view(start, end) {
+            return None;
+        }
+        install();
+        g = guards();
+    } else {
+        install();
+    }
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
-    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     // The range's clean blocks, in order: read off the set in one pass,
     // not looked up one block at a time. A frame asks about some 10 GB of
     // view memory, 150,000 blocks, nearly all clean: the lookups were most
     // of the 60-90 ms a frame of "guards" (run 54). What the loop adds to
     // the set meanwhile is the block it stands at or ones before it.
-    let clean: Vec<usize> = g.clean.range(first..last).copied().collect();
-    if clean.len() == last - first {
+    if g.clean.range(first..last).count() == last - first {
         // Nothing written, mapped or new since the range was last taken.
         return Some(written);
     }
+    let clean: Vec<usize> = g.clean.range(first..last).copied().collect();
     let mut next_clean = 0;
     let mut uncommitted_until = first;
     for block in first..=last {
