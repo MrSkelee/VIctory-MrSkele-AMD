@@ -2079,7 +2079,6 @@ impl<'a> Lower<'a> {
                 need(self.cur_ir);
                 return Err(WHERE);
             }
-<<<<<<< HEAD
             // One host wave of 64, some of its lanes elsewhere: their terms
             // are +0 on the console, so the sum of the lanes here is the
             // sum.
