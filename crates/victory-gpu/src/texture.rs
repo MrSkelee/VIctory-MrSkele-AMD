@@ -60,6 +60,7 @@ pub(crate) struct Staging {
     uploaded: std::sync::atomic::AtomicBool,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
+    piece: Option<Piece>,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -68,6 +69,7 @@ pub(crate) struct Staging {
 struct Last {
     hash: Option<blake3::Hash>,
     asked: u64,
+    waiting: Option<bool>,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
     /// The texture was found changed without a write the guard saw
@@ -638,12 +640,23 @@ impl Staging {
     /// Returns the bytes of title memory read.
     fn refresh_now(&self) -> usize {
         let whole = std::time::Instant::now();
-        let read = self.refresh_timed();
+        let read = self.refresh_timed(false);
         REFRESH_WAITS[3].fetch_add(whole.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
         read
     }
 
-    fn refresh_timed(&self) -> usize {
+    fn read_held(&self) -> usize {
+        let whole = std::time::Instant::now();
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(unseen) = last.waiting.take() else {
+            return 0;
+        };
+        let read = self.read_now(&mut last, self.size, unseen);
+        REFRESH_WAITS[3].fetch_add(whole.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        read
+    }
+
+    fn refresh_timed(&self, ask: bool) -> usize {
         let size = self.size;
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
@@ -702,6 +715,10 @@ impl Staging {
         // stays mapped (see `crate::watch::title_memory_reading`; without
         // it a page went between the asking and the read in runs 71 and
         // 74).
+        if ask {
+            last.waiting = Some(unseen);
+            return usize::MAX;
+        }
         let _mapped = if no_wait() {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
@@ -713,6 +730,10 @@ impl Staging {
         } else {
             waited(2, crate::watch::title_memory_reading)
         };
+        self.read_now(last, size, unseen)
+    }
+
+    fn read_now(&self, last: &mut Last, size: usize, unseen: bool) -> usize {
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages
             // there, the usual state while it streams in. Read through the
@@ -1122,6 +1143,122 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     there
 }
 
+pub(crate) fn batched() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_BATCH").is_none_or(|v| v != "0"))
+}
+
+pub(crate) static BATCHES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+pub(crate) fn refresh_all(stagings: &[Arc<Staging>]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if stagings.is_empty() {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let mut read = 0;
+    let mut waiting: Vec<&Staging> = Vec::new();
+    for staging in stagings {
+        let whole = std::time::Instant::now();
+        match staging.refresh_timed(true) {
+            usize::MAX => waiting.push(staging),
+            n => read += n,
+        }
+        REFRESH_WAITS[3].fetch_add(whole.elapsed().as_micros() as u64, Relaxed);
+    }
+    if !waiting.is_empty() {
+        let held = std::time::Instant::now();
+        let _mapped = waited(2, crate::watch::title_memory_reading);
+        REFRESH_WAITS[3].fetch_add(held.elapsed().as_micros() as u64, Relaxed);
+        let spare = std::thread::available_parallelism().map_or(1, |n| n.get() / 2).clamp(1, 12);
+        let threads = waiting.len().div_ceil(4).min(spare);
+        BATCHES[0].fetch_add(1, Relaxed);
+        BATCHES[1].fetch_add(waiting.len() as u64, Relaxed);
+        BATCHES[2].fetch_add(threads as u64, Relaxed);
+        let total = std::sync::atomic::AtomicUsize::new(0);
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let work = || {
+            while let Some(staging) = waiting.get(next.fetch_add(1, Relaxed)) {
+                total.fetch_add(staging.read_held(), Relaxed);
+            }
+        };
+        if threads <= 1 {
+            work();
+        } else {
+            std::thread::scope(|scope| {
+                for _ in 1..threads {
+                    scope.spawn(work);
+                }
+                work();
+            });
+        }
+        read += total.load(Relaxed);
+    }
+    let preparing = &crate::host::PREPARING;
+    preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+    preparing[3].fetch_add(read as u64, Relaxed);
+}
+
+fn pooled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STAGING_POOL").is_none_or(|v| v != "0"))
+}
+
+const POOL_BLOCK: u64 = 256 << 20;
+const POOL_GRAIN: u64 = 512;
+
+struct PoolBlock {
+    buffer: ID3D12Resource,
+    data: usize,
+    ranges: crate::ranges::Ranges,
+}
+
+static POOL_BLOCKS: Mutex<Vec<PoolBlock>> = Mutex::new(Vec::new());
+
+struct Piece {
+    block: usize,
+    offset: u64,
+    len: u64,
+}
+
+impl Drop for Piece {
+    fn drop(&mut self) {
+        let mut blocks = POOL_BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(block) = blocks.get_mut(self.block) {
+            block.ranges.give(self.offset, self.len);
+        }
+    }
+}
+
+fn upload_memory(total: u64) -> Option<(ID3D12Resource, *mut u8, u64, Option<Piece>)> {
+    let host = host()?;
+    let len = total.max(1).next_multiple_of(POOL_GRAIN);
+    if !pooled() || len > POOL_BLOCK / 4 {
+        let (buffer, data) = host.upload_buffer(total)?;
+        return Some((buffer, data, 0, None));
+    }
+    let mut blocks = POOL_BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    let found = blocks
+        .iter_mut()
+        .enumerate()
+        .rev()
+        .find_map(|(i, b)| b.ranges.take(len, POOL_GRAIN).map(|offset| (i, offset)));
+    let (block, offset) = match found {
+        Some(found) => found,
+        None => {
+            let (buffer, data) = host.upload_buffer(POOL_BLOCK)?;
+            let index = blocks.len();
+            crate::host::name(&buffer, || format!("staging block {index}"));
+            let mut ranges = crate::ranges::Ranges::new(POOL_BLOCK);
+            let offset = ranges.take(len, POOL_GRAIN)?;
+            blocks.push(PoolBlock { buffer, data: data as usize, ranges });
+            (index, offset)
+        }
+    };
+    let b = &blocks[block];
+    Some((b.buffer.clone(), b.data as *mut u8, offset, Some(Piece { block, offset, len })))
+}
+
 /// The staging state of a title texture from mip `first` on, made on first
 /// use (and made anew for larger mips than the one there holds).
 fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<Staging>> {
@@ -1176,13 +1313,18 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
             Some(&mut total),
         );
     }
-    let (buffer, data) = host.upload_buffer(total)?;
-    crate::host::name(&buffer, || {
-        format!(
-            "staging of {resource:?} {}x{}x{} f{}",
-            d.Width, d.Height, d.DepthOrArraySize, d.Format.0
-        )
-    });
+    let (buffer, data, base, piece) = upload_memory(total)?;
+    for footprint in &mut footprints {
+        footprint.Offset += base;
+    }
+    if piece.is_none() {
+        crate::host::name(&buffer, || {
+            format!(
+                "staging of {resource:?} {}x{}x{} f{}",
+                d.Width, d.Height, d.DepthOrArraySize, d.Format.0
+            )
+        });
+    }
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
@@ -1203,6 +1345,7 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
+        piece,
     });
     map.insert(resource as usize, s.clone());
     Some(s)

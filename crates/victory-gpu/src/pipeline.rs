@@ -62,6 +62,8 @@ pub(crate) struct Shader {
     pub(crate) hash: String,
     container: Vec<u8>,
     #[cfg(windows)]
+    pub(crate) resolves_light: bool,
+    #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
 
@@ -112,6 +114,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 hash: full.to_hex()[..16].to_owned(),
                 container: bytes.to_vec(),
                 #[cfg(windows)]
+                resolves_light: bytes.windows(crate::ambient::PROGRAM.len()).any(|w| w == crate::ambient::PROGRAM),
+                #[cfg(windows)]
                 translated: OnceLock::new(),
             })
         })
@@ -133,6 +137,7 @@ pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Opti
         stage,
         hash: full.to_hex()[..16].to_owned(),
         container: container.to_vec(),
+        resolves_light: container.windows(crate::ambient::PROGRAM.len()).any(|w| w == crate::ambient::PROGRAM),
         translated: OnceLock::new(),
     });
     let translated = shader.translated().is_some();

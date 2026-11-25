@@ -5154,7 +5154,12 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
+        let mut textures: Vec<std::sync::Arc<crate::texture::Staging>> = Vec::new();
         for step in &self.deferred().copies {
+            if !textures.is_empty() && !matches!(step, Step::Texture(_) | Step::Host(_) | Step::Refresh(..)) {
+                crate::texture::refresh_all(&textures);
+                textures.clear();
+            }
             let started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
@@ -5223,7 +5228,11 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
-                        staging.refresh();
+                        if crate::texture::batched() {
+                            textures.push(staging.clone());
+                        } else {
+                            staging.refresh();
+                        }
                     }
                     continue;
                 }
@@ -5231,6 +5240,7 @@ impl HostList {
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
+        crate::texture::refresh_all(&textures);
     }
 }
 
@@ -6009,6 +6019,7 @@ impl Meter {
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
+        crate::overlay::set_frame(fps, ms, draws);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
         let [cpu, gpu] = [0, 1].map(|i| {
             SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
@@ -6427,6 +6438,7 @@ impl Host {
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
+            crate::overlay::start(hwnd, self.adapter.clone());
             Ok(Presenter {
                 swap_chain,
                 width,

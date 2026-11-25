@@ -1785,6 +1785,39 @@ impl State {
         });
     }
 
+    /// After the dispatch of the program that resolves the indirect diffuse light: its
+    /// output raised to a least level (`crate::ambient`). True if a pass of ours ran on the
+    /// list (its state is then set again).
+    fn ambient(&self, list: &HostList, p: &crate::pipeline::host::HostPipeline) -> bool {
+        let Some(stage) = p.stages.first().filter(|s| s.shader.resolves_light) else {
+            return false;
+        };
+        let view = |kind: ResourceType, (slot, offset): (u8, u32)| {
+            let u = stage.translated().used.iter().find(|u| {
+                u.kind == kind
+                    && u.root == RootType::Table
+                    && (u.slot, u.table_offset_dwords) == (slot, offset)
+            })?;
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(u.slot)) else {
+                return None;
+            };
+            crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
+        };
+        let light = match view(ResourceType::Uav, crate::ambient::LIGHT) {
+            Some(View::Unordered(r, ..)) => r,
+            _ => 0,
+        };
+        if light == 0 {
+            once!("no ambient light: other tables");
+            return false;
+        }
+        let depth = match view(ResourceType::Srv, crate::ambient::DEPTH) {
+            Some(View::Shader(r, _)) => Some(r as This),
+            _ => None,
+        };
+        crate::ambient::raise(list, light as This, depth)
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
@@ -1852,6 +1885,9 @@ impl State {
             _ => unsafe { list.list.Dispatch(x, y, z) },
         }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        if self.ambient(list, p) {
+            self.replay(list);
+        }
     }
 
     /// What a draw or dispatch runs, for the device-removed report

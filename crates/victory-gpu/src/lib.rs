@@ -23,6 +23,8 @@ mod copystat;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
+mod ambient;
+#[cfg(windows)]
 mod draw;
 pub mod dxgi;
 #[cfg(windows)]
@@ -31,6 +33,10 @@ pub mod fence;
 pub mod frame;
 #[cfg(windows)]
 mod host;
+#[cfg(windows)]
+mod overlay;
+#[cfg(windows)]
+mod pixels;
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
@@ -42,6 +48,8 @@ pub mod pipeline;
 mod primitive;
 pub mod query;
 pub mod queue;
+#[cfg(windows)]
+mod ranges;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]

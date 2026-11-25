@@ -2,37 +2,52 @@
 
 > **Name:** `VIctory-MrSkele-AMD` — AMD Radeon fork of [fxceless/victory-fork](https://github.com/fxceless/victory-fork) / [VIctory](https://github.com/Marvisak/VIctory) (GPL-3.0).
 
-Tested on **Windows 11, Intel Core i5-14600KF, AMD Radeon RX 9060 XT 16 GB** (Series X profile): loads textures, characters, and interiors in-game at **3.5–4 FPS** (`~282 ms/frame`).
+Tested on **Windows 11, Intel Core i5-14600KF, AMD Radeon RX 9060 XT 16 GB** (Series S `--console series-s` + FidelityFX): loads textures, characters, and interiors in-game at **4+ real FPS / 8 FPS presented with FrameGen**.
 
 **No game files, code, logs, or assets are included.**
 
 ### Key Changes in `amd-test`
 - **In-process SEH memory copy (`fast_copy.c`):** replaces per-copy `ReadProcessMemory` syscalls with MSVC `__try`/`__except` `memmove` (silent first-chance VEH guard via `victory-core`, kernel fallback on unmapped holes).
 - **Watch & guard lock splitting (`watch.rs`, `shadow.rs`):** drops `JOURNAL` lock before page guarding, skips `GetWriteWatch` on known `GUARDED_VIEW` buffers, and avoids heap allocations on clean guard checks.
-- **Incremental `heap_buffers` spans (`draw.rs`):** maintains buffer copy spans incrementally per frame instead of rebuilding across tens of thousands of descriptor slots.
-- **Indirect draw coalescing (`draw.rs`, `indirect.rs`):** enables `VICTORY_INDIRECT_WINDOW` by default with `WINDOW_MOST = 256` and uses targeted UAV barriers around indirect clamps.
+- **Incremental `heap_buffers` spans (`draw.rs`) & indirect coalescing (`indirect.rs`):** maintains buffer copy spans incrementally per frame and batches indirect draws (`VICTORY_INDIRECT_WINDOW=1`, `WINDOW_MOST=256`).
+- **Parallel texture refresh & upload pool (`texture.rs`, `ranges.rs`):** pooled 256 MiB staging blocks and multi-threaded per-list texture detiling/refresh (`rorodev6/victory`).
+- **FidelityFX Series S Upscaler + Frame Generation (`ffx.rs`, `queue.rs`):** redirects title FidelityFX calls to PC `amd_fidelityfx_*.dll` (`VICTORY_FFX_DIR`), supports `VICTORY_FRAMEGEN=1` with multi-plane UI compositing (`Plane == 0x48`).
+- **Ambient light, top-right FPS overlay & VRAM retention (`ambient.rs`, `overlay.rs`, `resource.rs`):** adds `VICTORY_AMBIENT` interior indirect light pass, real-time top-right performance overlay (toggle `F10`), and `VICTORY_TEXTURE_IDLE_MS`.
 
-### Quick Launch (AMD)
+### Runtime Options (`VICTORY_*`)
+- `VICTORY_FFX_DIR`: folder containing PC FidelityFX DLLs (`amd_fidelityfx_loader_dx12.dll`, `amd_fidelityfx_upscaler_dx12.dll`, `amd_fidelityfx_framegeneration_dx12.dll`). Required for Series S upscaling/FrameGen.
+- `VICTORY_FRAMEGEN=1`: enables AMD FidelityFX Frame Generation (`0` off).
+- `VICTORY_AMBIENT=0.6`: interior/menu indirect light floor (`0` = none, `off` = title default).
+- `VICTORY_OVERLAY=0`: disables the top-right FPS/CPU/GPU/VRAM overlay (`1` by default, `F10` toggles visibility).
+- `VICTORY_TEXTURE_IDLE_MS=20000`: ms before unused textures are evicted from VRAM (default `15000`; higher values prevent black textures while moving on 16 GB cards).
+- `VICTORY_SKIP_PIPELINES`: comma-separated 16-char shader hashes to skip on AMD drivers (`c1eee35dbc50a9ef,f16876929fa64f9f`).
+
+### Quick Launch (AMD Series S)
 Build release (`cargo build --release -p victory`) and run with the flags in [scripts/run_gtavi.example.bat](scripts/run_gtavi.example.bat):
 
 ```powershell
 $env:VICTORY_RELAY = '0'
+$env:VICTORY_LATE_WAIT = '0'
 $env:VICTORY_FORCE_60FPS = '0'
 $env:VICTORY_DISPLAY_MODE = '1280x720'
 $env:VICTORY_INDIRECT_WINDOW = '1'
 $env:VICTORY_INPLACE = '2'
+$env:VICTORY_FFX_DIR = '<PATH_TO_FIDELITYFX_SIGNEDBIN>'
+$env:VICTORY_FRAMEGEN = '1'
+$env:VICTORY_AMBIENT = '0.6'
+$env:VICTORY_TEXTURE_IDLE_MS = '20000'
 $env:VICTORY_CARD_REHASH_RUNS = '1'
 $env:VICTORY_WIDE_BACK = '1'
 $env:VICTORY_WIDE_REFRESH = '1'
 $env:VICTORY_WIDE_MERGE = '1'
 $env:VICTORY_JOIN_COPIES = '1'
-$env:VICTORY_CARD_BUFFERS_MIN_MB = '16'
+$env:VICTORY_CARD_BUFFERS_MIN_MB = '4'
 $env:VICTORY_CARD_BUFFERS_MB = '2048'
-$env:VICTORY_CARD_WINDOWS_MB = '512'
+$env:VICTORY_CARD_WINDOWS_MB = '1024'
 $env:VICTORY_KEEP_SNAPSHOTS = '1'
 $env:VICTORY_KEEP_SNAPSHOTS_MB = '512'
 $env:VICTORY_SKIP_PIPELINES = 'c1eee35dbc50a9ef,f16876929fa64f9f'
-.\target\release\victory.exe run "<PATH_TO_GAME_EXE>" --execute
+.\target\release\victory.exe run "<PATH_TO_GAME_EXE>" --console series-s --execute
 ```
 
 ---
