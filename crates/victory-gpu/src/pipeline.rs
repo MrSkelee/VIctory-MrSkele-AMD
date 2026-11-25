@@ -181,12 +181,20 @@ impl Shader {
                         samplers = t.host.samplers.len(),
                         "shader translated"
                     ),
-                    Err(e) => tracing::warn!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        error = %e,
-                        "shader does not translate; its pipelines' draws are dropped"
-                    ),
+                    Err(e) => {
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            let path = std::env::temp_dir()
+                                .join(format!("victory-failed-{}.{}.cdxil", self.hash, self.stage));
+                            let _ = std::fs::write(&path, &self.container);
+                        }
+                        tracing::warn!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            error = %e,
+                            "shader does not translate; its pipelines' draws are dropped"
+                        );
+                    }
                 }
                 done.ok()
             })

@@ -1799,6 +1799,71 @@ impl<'a> Lower<'a> {
             Shape::Prefix(op, src, mask, ident, inclusive) => {
                 (op, src, mask, ident, Some(inclusive))
             }
+            Shape::Active64 { lo, hi, mask, high } => {
+                if self.mask_data == MaskData::None {
+                    return Err("a wave reduction in a mesh shader");
+                }
+                let c = self.cur;
+                let &m = self
+                    .x
+                    .st
+                    .masks
+                    .get(&mask)
+                    .ok_or("a wave reduction's untracked mask")?;
+                let on = self.boolean(m, c)?;
+                let (lo_v, hi_v) = (self.i32_of(lo)?, self.i32_of(hi)?);
+                let bits = self.f64_to_f32_bits(lo_v, hi_v);
+                let x = self.as_float(bits);
+                let z = self.s.m.f32(0);
+                let arg = self.s.m.select(c, on, x, z);
+                self.s.flags |= flags::WAVE_OPS;
+                let k0 = self.s.m.i8(0);
+                let sum = self.s.op(
+                    c,
+                    "waveActiveOp.f32",
+                    Attr::NoUnwind,
+                    self.s.t.f32,
+                    119,
+                    &[arg, k0, k0],
+                );
+                let sum_bits = self.as_int(sum);
+                if !high {
+                    let k29 = self.s.m.i32(29);
+                    let kexp = self.s.m.i32(0x7F80_0000);
+                    let kz = self.s.m.i32(0);
+                    let exp = self.s.m.bin(c, Bin::And, sum_bits, kexp);
+                    let is_z = self.s.m.cmp(c, pred::EQ, exp, kz);
+                    let lo_bits = self.s.m.bin(c, Bin::Shl, sum_bits, k29);
+                    return Ok(self.s.m.select(c, is_z, kz, lo_bits));
+                }
+                let (ksign, kexp, kmant, k23, k3, k896, k20, kinf, knan) = (
+                    self.s.m.i32(0x8000_0000),
+                    self.s.m.i32(0xFF),
+                    self.s.m.i32(0x7F_FFFF),
+                    self.s.m.i32(23),
+                    self.s.m.i32(3),
+                    self.s.m.i32(896),
+                    self.s.m.i32(20),
+                    self.s.m.i32(0x7FF0_0000),
+                    self.s.m.i32(0x7FF8_0000),
+                );
+                let kz = self.s.m.i32(0);
+                let sign = self.s.m.bin(c, Bin::And, sum_bits, ksign);
+                let exp = self.s.m.bin(c, Bin::LShr, sum_bits, k23);
+                let exp = self.s.m.bin(c, Bin::And, exp, kexp);
+                let mant = self.s.m.bin(c, Bin::And, sum_bits, kmant);
+                let exp64 = self.s.m.bin(c, Bin::Add, exp, k896);
+                let exp64 = self.s.m.bin(c, Bin::Shl, exp64, k20);
+                let mant64 = self.s.m.bin(c, Bin::LShr, mant, k3);
+                let norm = self.s.m.bin(c, Bin::Or, exp64, mant64);
+                let is_z = self.s.m.cmp(c, pred::EQ, exp, kz);
+                let is_inf = self.s.m.cmp(c, pred::EQ, exp, kexp);
+                let is_nan = self.s.m.cmp(c, pred::NE, mant, kz);
+                let inf_nan = self.s.m.select(c, is_nan, knan, kinf);
+                let body = self.s.m.select(c, is_inf, inf_nan, norm);
+                let body = self.s.m.select(c, is_z, kz, body);
+                return Ok(self.s.m.bin(c, Bin::Or, sign, body));
+            }
         };
         // Mesh: no host wave size can be declared, so a reduction is over this host wave
         // only. A minimum or maximum is taken that way: the compiler's "next distinct
