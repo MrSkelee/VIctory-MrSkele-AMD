@@ -51,6 +51,7 @@ pub(crate) extern "system" fn set_interval(
 ) -> HRESULT {
     let interval = match length {
         0 => SIXTIETH,
+        _ if std::env::var_os("VICTORY_FORCE_60FPS").is_some_and(|v| v == "1") => SIXTIETH,
         us => Duration::from_micros(u64::from(us)),
     };
     tracing::info!(?interval, "frame interval");

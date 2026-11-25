@@ -399,6 +399,73 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
     E_NOTIMPL
 }
 
+/// `D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PrebuildInputs {
+    kind: u32,
+    flags: u32,
+    num_descs: u32,
+    layout: u32,
+    descs: u64,
+}
+const _: () = assert!(size_of::<PrebuildInputs>() == 24);
+
+/// `D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct PrebuildInfo {
+    result: u64,
+    scratch: u64,
+    update: u64,
+}
+const _: () = assert!(size_of::<PrebuildInfo>() == 24);
+
+/// Device method 0x330 (`ID3D12Device5::GetRaytracingAccelerationStructurePrebuildInfo`).
+/// `XboxBvhBuilder::GetRaytracingAccelerationStructurePrebuildInfo` tail-calls
+/// this directly with `(device, pDesc, pInfo)`.
+extern "system" fn prebuild_info(
+    _: This,
+    desc: *const PrebuildInputs,
+    info: *mut PrebuildInfo,
+) {
+    if info.is_null() {
+        return;
+    }
+    let mut out = PrebuildInfo::default();
+    #[cfg(windows)]
+    if !desc.is_null()
+        && let Some(host) = crate::host::host()
+        && let Ok(d5) = windows::core::Interface::cast::<
+            windows::Win32::Graphics::Direct3D12::ID3D12Device5,
+        >(&host.device)
+    {
+        let mut host_info =
+            windows::Win32::Graphics::Direct3D12::D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO::default();
+        // SAFETY: `desc` and `host_info` follow the PC/Xbox shared layout.
+        unsafe { d5.GetRaytracingAccelerationStructurePrebuildInfo(desc.cast(), &mut host_info) };
+        out.result = host_info.ResultDataMaxSizeInBytes;
+        out.scratch = host_info.ScratchDataSizeInBytes;
+        out.update = host_info.UpdateScratchDataSizeInBytes;
+    }
+    if out.result == 0 {
+        // SAFETY: read only `num_descs` when `desc` is non-null.
+        let count = if desc.is_null() {
+            1u64
+        } else {
+            u64::from(unsafe { (*desc).num_descs }.max(1))
+        };
+        let bytes = (count * 256).next_multiple_of(256);
+        out = PrebuildInfo {
+            result: bytes,
+            scratch: bytes,
+            update: bytes,
+        };
+    }
+    // SAFETY: checked non-null `info` above.
+    unsafe { info.write(out) };
+}
+
 /// IUnknown 3, object methods 4, device methods 76 (0x18-0x290), then the
 /// methods `ID3D12Device1` to `ID3D12Device8` add, in order: 3, 1, 3, 6, 9,
 /// 1, 2, 9 (0x298-0x3a0, the console's own among them), then those of
@@ -453,6 +520,7 @@ static FUNCTIONS: Table<160> = {
     f[80] = frame::wait as *const (); // 0x280
     f[81] = frame::statistics as *const (); // 0x288
     f[86] = pipeline::create_stream as *const (); // 0x2b0
+    f[102] = prebuild_info as *const (); // 0x330
     f[108] = resource::allocation_info2 as *const (); // 0x360
     f[127] = resource::create_committed3 as *const (); // 0x3f8
     f[133] = resource::create_at_address as *const (); // 0x428
@@ -486,6 +554,24 @@ mod tests {
         );
         let missing = slot::<extern "system" fn() -> HRESULT>(device, 0xf0);
         assert_eq!(missing(), E_NOTIMPL);
+    }
+
+    #[test]
+    fn raytracing_prebuild_info_returns_nonzero_sizes() {
+        type Prebuild = extern "system" fn(This, *const PrebuildInputs, *mut PrebuildInfo);
+        let device = device();
+        let f = slot::<Prebuild>(device, 0x330);
+        let desc = PrebuildInputs {
+            kind: 0,
+            flags: 0,
+            num_descs: 4,
+            layout: 0,
+            descs: 0,
+        };
+        let mut info = PrebuildInfo::default();
+        f(device, &desc, &mut info);
+        assert!(info.result >= 256);
+        assert!(info.scratch >= 256);
     }
 
     #[test]
