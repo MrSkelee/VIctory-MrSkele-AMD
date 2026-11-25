@@ -585,13 +585,23 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     }
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+/// A present plane as the console lays it out: frame token, the plane's
+/// resources, their source rectangles and placements (optional), colour
+/// space and flags, then 24 bytes not read here. 0x48 bytes, so a second
+/// plane starts at +0x48 (in Series S mode the title's interface, 3840x2160,
+/// over its 1920x1080 game image).
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
+    _sources: *const u8,
+    _placements: *const u8,
+    _colour_space: u32,
+    _flags: u32,
+    _rest: [u64; 3],
 }
+const _: () = assert!(size_of::<Plane>() == 0x48);
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
