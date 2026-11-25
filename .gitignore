@@ -70,9 +70,11 @@
 *.7z
 *.rar
 
-# Editor / OS noise
+# Editor / OS / Log / Dump noise
 .vs/
 .idea/
 *.swp
+*.log
+*.dmp
 Thumbs.db
 .DS_Store

@@ -1,3 +1,42 @@
+# VIctory-MrSkele-AMD
+
+> **Name:** `VIctory-MrSkele-AMD` — AMD Radeon fork of [fxceless/victory-fork](https://github.com/fxceless/victory-fork) / [VIctory](https://github.com/Marvisak/VIctory) (GPL-3.0).
+
+Tested on **Windows 11, Intel Core i5-14600KF, AMD Radeon RX 9060 XT 16 GB** (Series X profile): loads textures, characters, and interiors in-game at **3.5–4 FPS** (`~282 ms/frame`).
+
+**No game files, code, logs, or assets are included.**
+
+### Key Changes in `amd-test`
+- **In-process SEH memory copy (`fast_copy.c`):** replaces per-copy `ReadProcessMemory` syscalls with MSVC `__try`/`__except` `memmove` (silent first-chance VEH guard via `victory-core`, kernel fallback on unmapped holes).
+- **Watch & guard lock splitting (`watch.rs`, `shadow.rs`):** drops `JOURNAL` lock before page guarding, skips `GetWriteWatch` on known `GUARDED_VIEW` buffers, and avoids heap allocations on clean guard checks.
+- **Incremental `heap_buffers` spans (`draw.rs`):** maintains buffer copy spans incrementally per frame instead of rebuilding across tens of thousands of descriptor slots.
+- **Indirect draw coalescing (`draw.rs`, `indirect.rs`):** enables `VICTORY_INDIRECT_WINDOW` by default with `WINDOW_MOST = 256` and uses targeted UAV barriers around indirect clamps.
+
+### Quick Launch (AMD)
+Build release (`cargo build --release -p victory`) and run with the flags in [scripts/run_gtavi.example.bat](scripts/run_gtavi.example.bat):
+
+```powershell
+$env:VICTORY_RELAY = '0'
+$env:VICTORY_FORCE_60FPS = '0'
+$env:VICTORY_DISPLAY_MODE = '1280x720'
+$env:VICTORY_INDIRECT_WINDOW = '1'
+$env:VICTORY_INPLACE = '2'
+$env:VICTORY_CARD_REHASH_RUNS = '1'
+$env:VICTORY_WIDE_BACK = '1'
+$env:VICTORY_WIDE_REFRESH = '1'
+$env:VICTORY_WIDE_MERGE = '1'
+$env:VICTORY_JOIN_COPIES = '1'
+$env:VICTORY_CARD_BUFFERS_MIN_MB = '16'
+$env:VICTORY_CARD_BUFFERS_MB = '2048'
+$env:VICTORY_CARD_WINDOWS_MB = '512'
+$env:VICTORY_KEEP_SNAPSHOTS = '1'
+$env:VICTORY_KEEP_SNAPSHOTS_MB = '512'
+$env:VICTORY_SKIP_PIPELINES = 'c1eee35dbc50a9ef,f16876929fa64f9f'
+.\target\release\victory.exe run "<PATH_TO_GAME_EXE>" --execute
+```
+
+---
+
 # VIctory fork (work in progress)
 
 ## This branch: victory-amd + a DirectStorage read fix
