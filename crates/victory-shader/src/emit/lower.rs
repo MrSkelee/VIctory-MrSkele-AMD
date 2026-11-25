@@ -1264,6 +1264,7 @@ impl<'a> Lower<'a> {
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
                     || n.starts_with("v_mbcnt")
+                    || n.starts_with("v_permlane")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
@@ -7302,6 +7303,53 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.select(c, is, a, old);
                 int(self, r)
             }
+            "v_permlane16_b32" | "v_permlanex16_b32" => {
+                if v.abs != 0 || v.neg != 0 || v.clamp || v.omod != 0 || v.sdwa.is_some() {
+                    return Err("modifiers on v_permlane");
+                }
+                self.cross_lane(false)?;
+                let (a, s1, s2) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let lane = self.lane_index();
+                let (k15, k8, k7, k4) = (
+                    self.s.m.i32(15),
+                    self.s.m.i32(8),
+                    self.s.m.i32(7),
+                    self.s.m.i32(4),
+                );
+                let in_row = self.s.m.bin(c, Bin::And, lane, k15);
+                let hi = self.s.m.cmp(c, pred::IUGE, in_row, k8);
+                let word = self.s.m.select(c, hi, s2, s1);
+                let nib = self.s.m.bin(c, Bin::And, in_row, k7);
+                let shift = self.s.m.bin(c, Bin::Mul, nib, k4);
+                let shifted = self.s.m.bin(c, Bin::LShr, word, shift);
+                let pick = self.s.m.bin(c, Bin::And, shifted, k15);
+                let not15 = self.s.m.i32(!15);
+                let mut row = self.s.m.bin(c, Bin::And, lane, not15);
+                if name == "v_permlanex16_b32" {
+                    let k16 = self.s.m.i32(16);
+                    row = self.s.m.bin(c, Bin::Xor, row, k16);
+                }
+                let src_lane = self.s.m.bin(c, Bin::Or, row, pick);
+                let mut r = self.read_lane(a, src_lane);
+                // bound_ctrl (opsel bit 1): return 0 when the source lane is inactive.
+                if v.opsel & 2 != 0 {
+                    let i32t = self.s.t.i32;
+                    let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+                    let on = guard.unwrap_or_else(|| self.s.m.bool(true));
+                    let ballot = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
+                    let (lo, hi) = (self.s.m.extract(c, ballot, 0), self.s.m.extract(c, ballot, 1));
+                    let k32 = self.s.m.i32(32);
+                    let in_hi = self.s.m.cmp(c, pred::IUGE, src_lane, k32);
+                    let mask_word = self.s.m.select(c, in_hi, hi, lo);
+                    let (k31, k1, kz) = (self.s.m.i32(31), self.s.m.i32(1), self.s.m.i32(0));
+                    let bit_idx = self.s.m.bin(c, Bin::And, src_lane, k31);
+                    let bit = self.s.m.bin(c, Bin::LShr, mask_word, bit_idx);
+                    let bit = self.s.m.bin(c, Bin::And, bit, k1);
+                    let active = self.s.m.cmp(c, pred::NE, bit, kz);
+                    r = self.s.m.select(c, active, r, kz);
+                }
+                int(self, r)
+            }
             "v_readfirstlane_b32"
                 if inst
                     .writes
@@ -11553,5 +11601,61 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    /// `v_permlane16_b32` and `v_permlanex16_b32` outside whole-wave sections
+    /// lower directly to `waveReadLaneAt` (with `waveActiveBallot` for `bound_ctrl:1`).
+    #[test]
+    fn permlane16_lowers_outside_whole_wave_section() {
+        for (op, opsel) in [(0x377u32, 0u32), (0x378u32, 2u32)] {
+            let vop3 = |vdst: u32, op: u32, opsel: u32, src0: u32, src1: u32, src2: u32| -> [u32; 2] {
+                [
+                    (0x35u32 << 26) | (op << 16) | (opsel << 11) | vdst,
+                    src0 | (src1 << 9) | (src2 << 18),
+                ]
+            };
+            let mut words = vec![
+                0xBE81_0380, // s_mov_b32 s1, 0
+                0xF408_0500,
+                0xFA00_0000, // s_load_dwordx4 s[20:23], s[0:1], 0 (raw UAV)
+                0x7E04_0280, // v_mov_b32 v2, 0
+            ];
+            words.extend_from_slice(&vop3(3, op, opsel, 258, 128, 128)); // v3 = permlane*(v2, 0, 0)
+            words.extend_from_slice(&[
+                0x38 << 26 | 0x1C << 18,
+                0x80 << 24 | 5 << 16 | 3 << 8, // buffer_store_dword v3, off, s[20:23], 0
+                S_ENDPGM,
+            ]);
+            let (layout, used) = texture_and_uav_tables();
+            let _ = lower_wave(&words, layout.clone(), used.clone(), true).expect("lower permlane");
+            #[cfg(windows)]
+            if let Ok(mut v) = crate::emit::validator::Validator::load(
+                crate::emit::validator::Validator::default_path().as_deref(),
+            ) {
+                let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+                let sgprs: u32 = layout.iter().map(|p| p.sgprs).sum();
+                let native = NativeProgram {
+                    stage: HwStage::Cs,
+                    wave64: true,
+                    vgprs: 20,
+                    layout,
+                    used,
+                    io: StageIo::Cs(ComputeIo {
+                        rsrc2: 1 << 15 | sgprs.max(2) << 1,
+                        threads: [64, 1, 1],
+                    }),
+                    code,
+                };
+                let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir");
+                let st = structure::structure(&p).expect("structure");
+                let io = io::raise(&p, &native).expect("io");
+                let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("res");
+                let empty_bytes = crate::dxbc::build(&[]);
+                let empty = crate::dxbc::Container::parse(&empty_bytes).unwrap();
+                let shader = crate::emit::emit(&empty, &native, &p, &st, &io, &res).expect("emit");
+                v.validate(&mut shader.dxil.clone())
+                    .expect("DXIL validation failed");
+            }
+        }
     }
 }

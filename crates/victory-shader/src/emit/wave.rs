@@ -435,9 +435,11 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                     })
                     .collect()
             }
-            ("v_permlanex16_b32", Some(a)) => {
-                // Lanes of each row read the other row of their half; lane
-                // i's pick is nibble i of {src2, src1}.
+            (op @ ("v_permlane16_b32" | "v_permlanex16_b32"), Some(a)) => {
+                // Lanes of each row read their own row (`permlane16`) or the
+                // other row of their half (`permlanex16`); lane i's pick is
+                // nibble i of {src2, src1}.
+                let flip = if op == "v_permlanex16_b32" { 16 } else { 0 };
                 let sel = |k: usize| match v.src.get(k) {
                     Some(&Operand::Const(c)) => crate::resource::inline(c),
                     Some(&Operand::Literal(x)) => Some(x),
@@ -448,7 +450,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                         let s = u64::from(s1) | u64::from(s2) << 32;
                         (0..wave)
                             .map(|l| {
-                                let other = (l & !31) | ((l & 16) ^ 16);
+                                let other = (l & !31) | ((l & 16) ^ flip);
                                 let pick = (s >> (4 * (l & 15)) & 15) as u32;
                                 a[(other | pick) as usize]
                             })
